@@ -5,14 +5,18 @@ import cv2
 import threading
 import time
 import numpy as np
+import json 
+import serial
 
 # from detect_function import YOLOv5Detector
 from information_ui import draw_information_ui
 from hobot_dnn import pyeasy_dnn as dnn
+from RM_serial_py.ser_api import  build_send_packet, receive_packet, Radar_decision, \
+    build_data_decision, build_data_radar_all
 
 
 loaded_arrays = np.load('arrays_test_red.npy')  # 加载标定好的仿射变换矩阵
-map_image = cv2.imread("images/bad_map.jpg")  # 加载红方视角地图
+map_image = cv2.imread("images/bad_map.jpg")  # 加载地图
 
 M_ground = loaded_arrays[0]  # 地面层
 
@@ -22,9 +26,13 @@ information_ui = np.zeros((500, 420, 3), dtype=np.uint8) * 255
 information_ui_show = information_ui.copy()
 
 # 加载地图
-map_backup = cv2.imread("images/map.jpg")
+map_backup = cv2.imread("images/bad_map.jpg")
 map = map_backup.copy()
 
+# 确定地图画面像素，保证不会溢出
+height, width = map_image.shape[:2]
+height -= 1
+width -= 1
 
 # 机器人坐标滤波器（滑动窗口均值滤波）
 class Filter:
@@ -326,7 +334,7 @@ for output in models[0].outputs:
 
 
 # 图像测试模式
-camera_mode = 'test'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
+camera_mode = 'hik'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
 camera_image = None
 
 if camera_mode == 'test':
@@ -358,32 +366,130 @@ while True:
     det_time = 0
     img0 = camera_image.copy()
     ts = time.time()
-    cv2.imshow("Image Window", img0)
-    # 神经网络识别
-    result_img = detect_and_draw(img0, models)
-    result0 = detector.predict(img0)
+    # cv2.imshow("Image Window", img0)
+    # # 神经网络识别
+    # result_img = detect_and_draw(img0, models)
+    # result0 = detector.predict(img0)
 
-    det_time += 1
-    for detection in result0:
-        cls, xywh, conf = detection
-        if cls == 'car':
-            left, top, w, h = xywh
-            left, top, w, h = int(left), int(top), int(w), int(h)
-            # 存储检测结果和区域
-            # 原图中框的中心下沿作为待仿射变化的点
-            camera_point = np.array([[[min(x + 0.5 * w, img_x), min(y + 1.5 * h, img_y)]]],
-                                    dtype=np.float32)
-            # 低到高依次仿射变化
-            # 套用仿射变化矩阵
-            mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
-            # 限制转换后的点在地图范围内
-            x_c = max(int(mapped_point[0][0][0]), 0)
-            y_c = max(int(mapped_point[0][0][1]), 0)
-            x_c = min(x_c, width)
-            y_c = min(y_c, height)
+    # det_time += 1
+    # for detection in result0:
+    #     cls, xywh, conf = detection
+    #     if cls == 'car':
+    #         left, top, w, h = xywh
+    #         left, top, w, h = int(left), int(top), int(w), int(h)
+    #         # 存储检测结果和区域
+    #         # 原图中框的中心下沿作为待仿射变化的点
+    #         camera_point = np.array([[[min(x + 0.5 * w, img_x), min(y + 1.5 * h, img_y)]]],
+    #                                 dtype=np.float32)
+            # # 低到高依次仿射变化
+            # # 套用仿射变化矩阵
+            # mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
+            # # 限制转换后的点在地图范围内
+            # x_c = max(int(mapped_point[0][0][0]), 0)
+            # y_c = max(int(mapped_point[0][0][1]), 0)
+            # x_c = min(x_c, width)
+            # y_c = min(y_c, height)
+
+    h, w = get_hw(models[0].inputs[0].properties)
+    des_dim = (w, h)
+    resized_data = cv2.resize(img0, des_dim, interpolation=cv2.INTER_AREA)
+    nv12_data = bgr2nv12_opencv(resized_data)
+    t0 = time.time()
+    outputs = models[0].forward(nv12_data)
+    t1 = time.time()
+    # print("inferece time is :", (t1 - t0))
+
+    # 获取结构体信息
+    yolov5_postprocess_info = Yolov5PostProcessInfo_t()
+    yolov5_postprocess_info.height = h
+    yolov5_postprocess_info.width = w
+    org_height, org_width = img0.shape[0:2]
+    yolov5_postprocess_info.ori_height = org_height
+    yolov5_postprocess_info.ori_width = org_width
+    yolov5_postprocess_info.score_threshold = 0.4 
+    yolov5_postprocess_info.nms_threshold = 0.45
+    yolov5_postprocess_info.nms_top_k = 20
+    yolov5_postprocess_info.is_pad_resize = 0
+
+    output_tensors = (hbDNNTensor_t * len(models[0].outputs))()
+    for i in range(len(models[0].outputs)):
+        output_tensors[i].properties.tensorLayout = get_TensorLayout(outputs[i].properties.layout)
+        # print(output_tensors[i].properties.tensorLayout)
+        if (len(outputs[i].properties.scale_data) == 0):
+            output_tensors[i].properties.quantiType = 0
+            output_tensors[i].sysMem[0].virAddr = ctypes.cast(outputs[i].buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), ctypes.c_void_p)
+        else:
+            output_tensors[i].properties.quantiType = 2       
+            output_tensors[i].properties.scale.scaleData = outputs[i].properties.scale_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            output_tensors[i].sysMem[0].virAddr = ctypes.cast(outputs[i].buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), ctypes.c_void_p)
+            
+        for j in range(len(outputs[i].properties.shape)):
+            output_tensors[i].properties.validShape.dimensionSize[j] = outputs[i].properties.shape[j]
+        
+        libpostprocess.Yolov5doProcess(output_tensors[i], ctypes.pointer(yolov5_postprocess_info), i)
+
+    result_str = get_Postprocess_result(ctypes.pointer(yolov5_postprocess_info))  
+    result_str = result_str.decode('utf-8')  
+    t2 = time.time()
+    # print("postprocess time is :", (t2 - t1))
+    #print(result_str)
+
+    t0 = time.time()
+    # draw result
+    # 解析JSON字符串  
+    data = json.loads(result_str[16:])  
+
+    # allowed_ids = {0, 1}  # 只保留 id 为 0 和 1 的类别
+    allowed_names = {"person"}  # 或者用类别名称
+
+    # 遍历每一个结果  
+    for result in data:  
+        if result['name'] not in allowed_names:
+            continue  # 跳过不需要的类别
+
+        bbox = result['bbox']  # 矩形框位置信息  
+        score = result['score']  # 得分  
+        id = result['id']  # id  
+        name = result['name']  # 类别名称  
+    
+        # 计算下沿1/4高的中心点
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = y2 - y1
+        center_x = min(x1 + 0.5 * w, img0.shape[1])
+        center_y = min(y2 - 0.25 * h, img0.shape[0])
+        camera_point = np.array([[[center_x, center_y]]], dtype=np.float32)
+        print(f"下沿1/4高中心点: {camera_point}")
+        # 在该点画圆
+        cv2.circle(img0, (int(center_x), int(center_y)), 5, (0, 0, 255), -1)
+
+        # 打印信息  
+        print(f"bbox: {bbox}, score: {score}, id: {id}, name: {name}")
+
+        # 在图片上画出边界框  
+        cv2.rectangle(img0, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 255, 0), 2)  
+    
+        # 在边界框上方显示类别名称和得分  
+        font = cv2.FONT_HERSHEY_SIMPLEX  
+        cv2.putText(img0, f'{name} {score:.2f}', (int(bbox[0]), int(bbox[1]) - 10), font, 0.5, (0, 255, 0), 1)  
+  
+        # 套用仿射变化矩阵
+        mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
+        # 限制转换后的点在地图范围内
+        x_c = max(int(mapped_point[0][0][0]), 0)
+        y_c = max(int(mapped_point[0][0][1]), 0)
+        x_c = min(x_c, width)
+        y_c = min(y_c, height)
 
 
     te = time.time()
     t_p = te - ts
     print("fps:", 1 / t_p)  # 打印帧率
+
+    # 绘制UI
+    map_show = cv2.resize(map, (600, 320))
+    cv2.imshow('map', map_show)
+    img0 = cv2.resize(img0, (1300, 900))
+    cv2.imshow('img', img0)
+
     key = cv2.waitKey(1)
