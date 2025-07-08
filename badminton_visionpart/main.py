@@ -6,21 +6,22 @@ import threading
 import time
 import numpy as np
 
-from detect_function import YOLOv5Detector
+# from detect_function import YOLOv5Detector
 from information_ui import draw_information_ui
+from hobot_dnn import pyeasy_dnn as dnn
 
 
 loaded_arrays = np.load('arrays_test_red.npy')  # 加载标定好的仿射变换矩阵
 map_image = cv2.imread("images/bad_map.jpg")  # 加载红方视角地图
 
-M_ground = loaded_arrays[0]  # 地面层、公路层
+M_ground = loaded_arrays[0]  # 地面层
 
 
-# 初始化战场信息UI
+# 初始化UI
 information_ui = np.zeros((500, 420, 3), dtype=np.uint8) * 255
 information_ui_show = information_ui.copy()
 
-# 加载战场地图
+# 加载地图
 map_backup = cv2.imread("images/map.jpg")
 map = map_backup.copy()
 
@@ -36,7 +37,6 @@ class Filter:
 
     # 添加机器人坐标数据
     def add_data(self, name, x, y, threshold=100000.0):  # 阈值单位为mm，实测没啥用，不如直接给大点
-        global guess_list
         if name not in self.data:
             # 如果实体名称不在数据字典中，初始化相应的deque。
             self.data[name] = deque(maxlen=self.window_size)
@@ -53,7 +53,6 @@ class Filter:
 
         # 将坐标数据添加到数据字典和滑动窗口中。
         self.data[name].append((x, y))
-        guess_list[name] = False
 
         self.window[name].append((x, y))
         self.last_update[name] = time.time()  # 更新最后更新时间
@@ -76,15 +75,7 @@ class Filter:
     def get_all_data(self):
         filtered_d = {}
         for name in self.data:
-            # 超过max_inactive_time没识别到机器人将会清空缓冲区，并进行盲区预测
-            if time.time() - self.last_update[name] > self.max_inactive_time:
-                self.data[name].clear()
-                self.window[name].clear()
-                guess_list[name] = True
-            # 识别到机器人，不进行盲区预测
-            else:
-                guess_list[name] = False
-                filtered_d[name] = self.filter_data(name)
+            filtered_d[name] = self.filter_data(name)
         # 返回所有当前识别到的机器人及其坐标的均值
         return filtered_d
 
@@ -211,28 +202,135 @@ def video_capture_get():
             time.sleep(0.016)  # 60fps
 
 
+class hbSysMem_t(ctypes.Structure):
+    _fields_ = [
+        ("phyAddr",ctypes.c_double),
+        ("virAddr",ctypes.c_void_p),
+        ("memSize",ctypes.c_int)
+    ]
 
-# 创建机器人坐标滤波器
+class hbDNNQuantiShift_yt(ctypes.Structure):
+    _fields_ = [
+        ("shiftLen",ctypes.c_int),
+        ("shiftData",ctypes.c_char_p)
+    ]
+
+class hbDNNQuantiScale_t(ctypes.Structure):
+    _fields_ = [
+        ("scaleLen",ctypes.c_int),
+        ("scaleData",ctypes.POINTER(ctypes.c_float)),
+        ("zeroPointLen",ctypes.c_int),
+        ("zeroPointData",ctypes.c_char_p)
+    ]    
+
+class hbDNNTensorShape_t(ctypes.Structure):
+    _fields_ = [
+        ("dimensionSize",ctypes.c_int * 8),
+        ("numDimensions",ctypes.c_int)
+    ]
+
+class hbDNNTensorProperties_t(ctypes.Structure):
+    _fields_ = [
+        ("validShape",hbDNNTensorShape_t),
+        ("alignedShape",hbDNNTensorShape_t),
+        ("tensorLayout",ctypes.c_int),
+        ("tensorType",ctypes.c_int),
+        ("shift",hbDNNQuantiShift_yt),
+        ("scale",hbDNNQuantiScale_t),
+        ("quantiType",ctypes.c_int),
+        ("quantizeAxis", ctypes.c_int),
+        ("alignedByteSize",ctypes.c_int),
+        ("stride",ctypes.c_int * 8)
+    ]
+
+class hbDNNTensor_t(ctypes.Structure):
+    _fields_ = [
+        ("sysMem",hbSysMem_t * 4),
+        ("properties",hbDNNTensorProperties_t)
+    ]
+
+
+class Yolov5PostProcessInfo_t(ctypes.Structure):
+    _fields_ = [
+        ("height",ctypes.c_int),
+        ("width",ctypes.c_int),
+        ("ori_height",ctypes.c_int),
+        ("ori_width",ctypes.c_int),
+        ("score_threshold",ctypes.c_float),
+        ("nms_threshold",ctypes.c_float),
+        ("nms_top_k",ctypes.c_int),
+        ("is_pad_resize",ctypes.c_int)
+    ]
+
+libpostprocess = ctypes.CDLL('/usr/lib/libpostprocess.so') 
+
+get_Postprocess_result = libpostprocess.Yolov5PostProcess
+get_Postprocess_result.argtypes = [ctypes.POINTER(Yolov5PostProcessInfo_t)]  
+get_Postprocess_result.restype = ctypes.c_char_p  
+
+def get_TensorLayout(Layout):
+    if Layout == "NCHW":
+        return int(2)
+    else:
+        return int(0)
+
+
+def bgr2nv12_opencv(image):
+    height, width = image.shape[0], image.shape[1]
+    area = height * width
+    yuv420p = cv2.cvtColor(image, cv2.COLOR_BGR2YUV_I420).reshape((area * 3 // 2,))
+    y = yuv420p[:area]
+    uv_planar = yuv420p[area:].reshape((2, area // 4))
+    uv_packed = uv_planar.transpose((1, 0)).reshape((area // 2,))
+
+    nv12 = np.zeros_like(yuv420p)
+    nv12[:height * width] = y
+    nv12[height * width:] = uv_packed
+    return nv12
+
+
+def get_hw(pro):
+    if pro.layout == "NCHW":
+        return pro.shape[2], pro.shape[3]
+    else:
+        return pro.shape[1], pro.shape[2]
+
+
+def print_properties(pro):
+    print("tensor type:", pro.tensor_type)
+    print("data type:", pro.dtype)
+    print("layout:", pro.layout)
+    print("shape:", pro.shape)
+
+
+
+# 创建坐标滤波器
 filter = Filter(window_size=3, max_inactive_time=2)
 # 加载模型，实例化机器人检测器和装甲板检测器
-weights_path = 'models/car.onnx'  # 建议把模型转换成TRT的engine模型，推理速度提升10倍，转换方式看README
-weights_path_next = 'models/armor.onnx'
+# weights_path = 'models/car.onnx'  # 建议把模型转换成TRT的engine模型，推理速度提升10倍，转换方式看README
+# weights_path_next = 'models/armor.onnx'
 # weights_path = 'models/car.engine'
 # weights_path_next = 'models/armor.engine'
-detector = YOLOv5Detector(weights_path, data='yaml/car.yaml', conf_thres=0.1, iou_thres=0.5, max_det=14, ui=True)
-detector_next = YOLOv5Detector(weights_path_next, data='yaml/armor.yaml', conf_thres=0.50, iou_thres=0.2,
-                               max_det=1,
-                               ui=True)
+models = dnn.load('./models/yolov5s_672x672_nv12.bin')
+# detector = YOLOv5Detector(weights_path, data='yaml/car.yaml', conf_thres=0.1, iou_thres=0.5, max_det=14, ui=True)
+# detector_next = YOLOv5Detector(weights_path_next, data='yaml/armor.yaml', conf_thres=0.50, iou_thres=0.2,
+#                                max_det=1,
+#                                ui=True)
+
+# 打印输入 tensor 的属性
+print_properties(models[0].inputs[0].properties)
+# 打印输出 tensor 的属性
+print(len(models[0].outputs))
+for output in models[0].outputs:
+    print_properties(output.properties)
 
 
-
-# 图像测试模式（获取图像根据自己的设备，在）
-camera_mode = 'hik'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
-
+# 图像测试模式
+camera_mode = 'test'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
 camera_image = None
 
 if camera_mode == 'test':
-    camera_image = cv2.imread('images/test_image.jpg')
+    camera_image = cv2.imread('kite.jpg')
 elif camera_mode == 'hik':
     # 海康相机图像获取线程
     thread_camera = threading.Thread(target=hik_camera_get, daemon=True)
@@ -260,114 +358,32 @@ while True:
     det_time = 0
     img0 = camera_image.copy()
     ts = time.time()
-    # 第一层神经网络识别
+    cv2.imshow("Image Window", img0)
+    # 神经网络识别
+    result_img = detect_and_draw(img0, models)
     result0 = detector.predict(img0)
+
     det_time += 1
     for detection in result0:
         cls, xywh, conf = detection
         if cls == 'car':
             left, top, w, h = xywh
             left, top, w, h = int(left), int(top), int(w), int(h)
-            # 存储第一次检测结果和区域
-            # ROI出机器人区域
-            cropped = camera_image[top:top + h, left:left + w]
-            cropped_img = np.ascontiguousarray(cropped)
-            # 第二层神经网络识别
-            result_n = detector_next.predict(cropped_img)
-            det_time += 1
-            if result_n:
-                # 叠加第二次检测结果到原图的对应位置
-                img0[top:top + h, left:left + w] = cropped_img
+            # 存储检测结果和区域
+            # 原图中框的中心下沿作为待仿射变化的点
+            camera_point = np.array([[[min(x + 0.5 * w, img_x), min(y + 1.5 * h, img_y)]]],
+                                    dtype=np.float32)
+            # 低到高依次仿射变化
+            # 套用仿射变化矩阵
+            mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
+            # 限制转换后的点在地图范围内
+            x_c = max(int(mapped_point[0][0][0]), 0)
+            y_c = max(int(mapped_point[0][0][1]), 0)
+            x_c = min(x_c, width)
+            y_c = min(y_c, height)
 
-                for detection1 in result_n:
-                    cls, xywh, conf = detection1
-                    if cls:  # 所有装甲板都处理，可选择屏蔽一些:
-                        x, y, w, h = xywh
-                        x = x + left
-                        y = y + top
 
-                        t1 = time.time()
-                        
-                        # 先套用地面层仿射变化矩阵
-                        mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
-                        # 限制转换后的点在地图范围内
-                        x_c = max(int(mapped_point[0][0][0]), 0)
-                        y_c = max(int(mapped_point[0][0][1]), 0)
-                        x_c = min(x_c, width)
-                        y_c = min(y_c, height)
-    
-    # 获取所有识别到的机器人坐标
-    all_filter_data = filter.get_all_data()
-    # print(all_filter_data_name)
-    if all_filter_data != {}:
-        for name, xyxy in all_filter_data.items():
-            if xyxy is not None:
-                if name[0] == "R":
-                    color_m = (0, 0, 255)
-                else:
-                    color_m = (255, 0, 0)
-                if state == 'R':
-                    filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
-                else:
-                    filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
-                # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
-                if name[0] != state:
-                    cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
-                    cv2.putText(map, str(name),
-                                (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
-                    ser_x = int(filtered_xyz[0]) * 10 / 10
-                    ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
-                    cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
-                                (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
-    
     te = time.time()
     t_p = te - ts
     print("fps:", 1 / t_p)  # 打印帧率
-    # # 绘制UI
-    # _ = draw_information_ui(progress_list, state, information_ui_show)
-    # cv2.putText(information_ui_show, "vulnerability_chances: " + str(double_vulnerability_chance),
-    #             (10, 350),
-    #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    # cv2.putText(information_ui_show, "vulnerability_Triggering: " + str(opponent_double_vulnerability),
-    #             (10, 400),
-    #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.imshow('information_ui', information_ui_show)
-    map_show = cv2.resize(map, (600, 320))
-    cv2.imshow('map', map_show)
-    img0 = cv2.resize(img0, (1300, 900))
-    cv2.imshow('img', img0)
-
     key = cv2.waitKey(1)
-
-    # det_time = 0
-    # img0 = camera_image.copy()
-    # ts = time.time()
-    # cv2.imshow("Image Window", img0)
-    # # 第一层神经网络识别
-    # result0 = detector.predict(img0)
-    # det_time += 1
-    # for detection in result0:
-    #     cls, xywh, conf = detection
-    #     if cls == 'car':
-    #         left, top, w, h = xywh
-    #         left, top, w, h = int(left), int(top), int(w), int(h)
-    #         # 存储第一次检测结果和区域
-    #         # 原图中框的中心下沿作为待仿射变化的点
-    #         camera_point = np.array([[[min(x + 0.5 * w, img_x), min(y + 1.5 * h, img_y)]]],
-    #                                 dtype=np.float32)
-    #         # 低到高依次仿射变化
-    #         # 先套用地面层仿射变化矩阵
-    #         mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
-    #         # 限制转换后的点在地图范围内
-    #         x_c = max(int(mapped_point[0][0][0]), 0)
-    #         y_c = max(int(mapped_point[0][0][1]), 0)
-    #         x_c = min(x_c, width)
-    #         y_c = min(y_c, height)
-
-
-    # te = time.time()
-    # t_p = te - ts
-    # print("fps:", 1 / t_p)  # 打印帧率
-    # key = cv2.waitKey(1)
