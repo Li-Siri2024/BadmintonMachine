@@ -11,12 +11,15 @@ import serial
 # from detect_function import YOLOv5Detector
 from information_ui import draw_information_ui
 from hobot_dnn import pyeasy_dnn as dnn
-from RM_serial_py.ser_api import  build_send_packet, receive_packet, Radar_decision, \
-    build_data_decision, build_data_radar_all
+from RM_serial_py.ser_api import  build_send_packet, receive_packet, build_data_radar
+import queue
+
+# yaw_pit_queue = queue.Queue(maxsize=5)
+yaw_pit_queue = queue.Queue()
 
 
 loaded_arrays = np.load('arrays_test_red.npy')  # 加载标定好的仿射变换矩阵
-map_image = cv2.imread("images/bad_map.jpg")  # 加载地图
+map_image = cv2.imread("images/resized_image.jpg")  # 加载地图
 
 M_ground = loaded_arrays[0]  # 地面层
 
@@ -26,7 +29,7 @@ information_ui = np.zeros((500, 420, 3), dtype=np.uint8) * 255
 information_ui_show = information_ui.copy()
 
 # 加载地图
-map_backup = cv2.imread("images/bad_map.jpg")
+map_backup = cv2.imread("images/resized_image.jpg")
 map = map_backup.copy()
 
 # 确定地图画面像素，保证不会溢出
@@ -34,16 +37,16 @@ height, width = map_image.shape[:2]
 height -= 1
 width -= 1
 
-# 机器人坐标滤波器（滑动窗口均值滤波）
+# 坐标滤波器（滑动窗口均值滤波）
 class Filter:
     def __init__(self, window_size, max_inactive_time=2.0):
         self.window_size = window_size
         self.max_inactive_time = max_inactive_time
-        self.data = {}  # 存储不同机器人的数据
+        self.data = {}  # 存储不同人物的数据
         self.window = {}  # 存储滑动窗口内的数据
-        self.last_update = {}  # 存储每个机器人的最后更新时间
+        self.last_update = {}  # 存储每个人的最后更新时间
 
-    # 添加机器人坐标数据
+    # 添加坐标数据
     def add_data(self, name, x, y, threshold=100000.0):  # 阈值单位为mm，实测没啥用，不如直接给大点
         if name not in self.data:
             # 如果实体名称不在数据字典中，初始化相应的deque。
@@ -79,12 +82,12 @@ class Filter:
 
         return x_avg, y_avg
 
-    # 获取所有机器人坐标
+    # 获取所有坐标
     def get_all_data(self):
         filtered_d = {}
         for name in self.data:
             filtered_d[name] = self.filter_data(name)
-        # 返回所有当前识别到的机器人及其坐标的均值
+        # 返回所有当前识别到的人及其坐标的均值
         return filtered_d
 
 
@@ -311,19 +314,83 @@ def print_properties(pro):
     print("shape:", pro.shape)
 
 
+def ser_receive():
+    buffer = b''  # 初始化缓冲区
+    while True:
+        # 从串口读取数据
+        received_data = ser1.read_all()  # 读取一秒内收到的所有串口数据
+        # 将读取到的数据添加到缓冲区中
+        buffer += received_data
+
+        # 查找帧头（SOF）的位置
+        sof_index = buffer.find(b'\xA5')
+
+        while sof_index != -1:
+            # 如果找到帧头，尝试解析数据包
+            if len(buffer) >= sof_index + 5:  # 至少需要5字节才能解析帧头
+                # 从帧头开始解析数据包
+                packet_data = buffer[sof_index:]
+
+                # 查找下一个帧头的位置
+                next_sof_index = packet_data.find(b'\xA5', 1)
+
+                if next_sof_index != -1:
+                    # 如果找到下一个帧头，说明当前帧头到下一个帧头之间是一个完整的数据包
+                    packet_data = packet_data[:next_sof_index]
+                    # print(packet_data)
+                else:
+                    # 如果没找到下一个帧头，说明当前帧头到末尾不是一个完整的数据包
+                    break
+
+                # 解析数据包
+                progress_result = receive_packet(packet_data,info=False)  # 解析单个数据包，不输出日志
+                # 更新数据
+                if progress_result is not None:
+                    received_data1, received_seq1 = progress_result
+                    progress_list = list(received_data1)
+                    rec_yaw= progress_list[0]
+                    rec_pit= progress_list[1]
+
+                # 从缓冲区中移除已解析的数据包
+                buffer = buffer[sof_index + len(packet_data):]
+
+                # 继续寻找下一个帧头的位置
+                sof_index = buffer.find(b'\xA5')
+
+            else:
+                # 缓冲区中的数据不足以解析帧头，继续读取串口数据
+                break
+        time.sleep(0.5)
+
+
+# 串口发送线程
+def ser_send():
+    seq = 0
+    time_s = time.time()
+    update_time = 0  # 上次预测点更新时间
+    yaw=0
+    pit=0
+
+    while True:
+        try:
+            # 如果队列有新数据，取出最新的yaw和pit
+            yaw, pit = yaw_pit_queue.get_nowait()
+        except queue.Empty:
+            yaw, pit = 0, 0  # 没有新数据则都等于0
+
+        # 打印当前要发送的yaw和pit
+        print(f"发送: yaw={yaw}, pit={pit}")
+
+        ser_data = build_data_radar(yaw,pit)
+        packet, seq = build_send_packet(ser_data, seq)
+        ser1.write(packet)
+        time.sleep(0.2)
+
 
 # 创建坐标滤波器
 filter = Filter(window_size=3, max_inactive_time=2)
-# 加载模型，实例化机器人检测器和装甲板检测器
-# weights_path = 'models/car.onnx'  # 建议把模型转换成TRT的engine模型，推理速度提升10倍，转换方式看README
-# weights_path_next = 'models/armor.onnx'
-# weights_path = 'models/car.engine'
-# weights_path_next = 'models/armor.engine'
+# 加载模型
 models = dnn.load('./models/yolov5s_672x672_nv12.bin')
-# detector = YOLOv5Detector(weights_path, data='yaml/car.yaml', conf_thres=0.1, iou_thres=0.5, max_det=14, ui=True)
-# detector_next = YOLOv5Detector(weights_path_next, data='yaml/armor.yaml', conf_thres=0.50, iou_thres=0.2,
-#                                max_det=1,
-#                                ui=True)
 
 # 打印输入 tensor 的属性
 print_properties(models[0].inputs[0].properties)
@@ -335,6 +402,16 @@ for output in models[0].outputs:
 
 # 图像测试模式
 camera_mode = 'hik'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
+ser1 = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)  # 串口，替换 'COM1' 为你的串口号
+
+# 串口发送线程
+thread_list = threading.Thread(target=ser_send, daemon=True)
+thread_list.start()
+
+# # 串口接收线程
+# thread_receive = threading.Thread(target=ser_receive, daemon=True)
+# thread_receive.start()
+
 camera_image = None
 
 if camera_mode == 'test':
@@ -366,29 +443,6 @@ while True:
     det_time = 0
     img0 = camera_image.copy()
     ts = time.time()
-    # cv2.imshow("Image Window", img0)
-    # # 神经网络识别
-    # result_img = detect_and_draw(img0, models)
-    # result0 = detector.predict(img0)
-
-    # det_time += 1
-    # for detection in result0:
-    #     cls, xywh, conf = detection
-    #     if cls == 'car':
-    #         left, top, w, h = xywh
-    #         left, top, w, h = int(left), int(top), int(w), int(h)
-    #         # 存储检测结果和区域
-    #         # 原图中框的中心下沿作为待仿射变化的点
-    #         camera_point = np.array([[[min(x + 0.5 * w, img_x), min(y + 1.5 * h, img_y)]]],
-    #                                 dtype=np.float32)
-            # # 低到高依次仿射变化
-            # # 套用仿射变化矩阵
-            # mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
-            # # 限制转换后的点在地图范围内
-            # x_c = max(int(mapped_point[0][0][0]), 0)
-            # y_c = max(int(mapped_point[0][0][1]), 0)
-            # x_c = min(x_c, width)
-            # y_c = min(y_c, height)
 
     h, w = get_hw(models[0].inputs[0].properties)
     des_dim = (w, h)
@@ -480,14 +534,26 @@ while True:
         y_c = max(int(mapped_point[0][0][1]), 0)
         x_c = min(x_c, width)
         y_c = min(y_c, height)
+        cv2.circle(map, (int(mapped_point[0][0][0]), int(mapped_point[0][0][1])), 5, (0, 0, 255), -1)
 
+
+        pit = 0
+        yaw = 0 
+        real_x = int(mapped_point[0][0][0]-190)/100 # 单位（米）
+        real_z = int(1340-mapped_point[0][0][1])/100 # 单位（米）
+        yaw = np.arctan(real_x / real_z)  # 返回弧度
+        # 轉角度
+        yaw = np.degrees(yaw)
+        pit = 0
+        yaw_pit_queue.put((yaw, pit))
+        # print("yaw (deg):", yaw)
 
     te = time.time()
     t_p = te - ts
     print("fps:", 1 / t_p)  # 打印帧率
 
     # 绘制UI
-    map_show = cv2.resize(map, (600, 320))
+    map_show = cv2.resize(map, (610, 1340))
     cv2.imshow('map', map_show)
     img0 = cv2.resize(img0, (1300, 900))
     cv2.imshow('img', img0)

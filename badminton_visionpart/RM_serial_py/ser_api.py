@@ -93,94 +93,32 @@ def Get_CRC16_Check_Sum(pchMessage, dwLength):
     return wCRC
 
 
-# 雷达数据部分构建示例
-def build_data_radar(target_robot_id, target_position_x, target_position_y):
+# 数据部分构建
+def build_data_radar(target_yaw, target_pit):
     data = bytearray()
-    data.extend(bytearray(struct.pack('H', target_robot_id)))  # 目标机器人ID (小端)
-    data.extend(bytearray(struct.pack('f', target_position_x)))  # x坐标 (小端)
-    data.extend(bytearray(struct.pack('f', target_position_y)))  # y坐标 (小端)
+    data.extend(bytearray(struct.pack('f', target_yaw)))  # x坐标 (小端)
+    data.extend(bytearray(struct.pack('f', target_pit)))  # y坐标 (小端)
     return data
-
-
-# 雷达数据部分构建示例
-def build_data_radar_all(send_map,state):
-    if state == 'R':
-        data = bytearray()
-        data.extend(bytearray(struct.pack('H', int(send_map['B1'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B1'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B2'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B2'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B3'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B3'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B4'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B4'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B5'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B5'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B7'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B7'][1]))))  # y坐标 (小端)
-    else:
-        data = bytearray()
-        data.extend(bytearray(struct.pack('H', int(send_map['R1'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R1'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R2'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R2'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R3'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R3'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R4'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R4'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R5'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R5'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R7'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R7'][1]))))  # y坐标 (小端)
-
-    return data
-
-
-
-def build_data_decision(chances,state):
-    data = bytearray()
-    cmd_id = [0x01, 0x21]
-    cmd_id = bytearray([cmd_id[1], cmd_id[0]])
-    data.extend(cmd_id)
-    if state == 'R':
-        data.extend(bytearray(struct.pack('H', 9)))
-    else:
-        data.extend(bytearray(struct.pack('H', 109)))
-    data.extend(bytearray([0x80,0x80]))
-    data.extend(bytearray(struct.pack('B', chances)))
-    return data
-
 
 
 # 完整数据包构建
-def build_send_packet(data, seq, cmd_id):
+def build_send_packet(data, seq):
     data_length = len(data)  # 数据部分长度
     frame_header = bytearray([0xA5])  # SOF
-    cmd_id = bytearray([cmd_id[1], cmd_id[0]])
     frame_header.extend(struct.pack('H', data_length))  # 编码数据长度 (小端)
     frame_header.append(seq)  # seq
     crc8 = Get_CRC8_Check_Sum(frame_header, 4)
     frame_header.append(crc8)  # CRC8校验码
     frame_tail = bytearray()
     # 帧尾CRC16校验
-    frame_tail.extend(struct.pack('H', Get_CRC16_Check_Sum(frame_header + cmd_id + data,
-                                                           len(frame_header + cmd_id + data) + 1)))
-    packet = frame_header + cmd_id + data + frame_tail
+    frame_tail.extend(struct.pack('H', Get_CRC16_Check_Sum(frame_header + data,
+                                                           len(frame_header + data) + 1)))
+    packet = frame_header + data + frame_tail
     return packet, (seq + 1) % 256
 
 
 # 单个数据包的特定命令码解析
-def receive_packet(serial_data, expected_cmd_id, info):
+def receive_packet(serial_data, info):
     # 定义常量
 
     FRAME_HEADER_LEN = 5  # 帧头长度（SOF + 数据长度 + 序列号 + CRC8校验码）
@@ -215,17 +153,8 @@ def receive_packet(serial_data, expected_cmd_id, info):
             print('CRC8校验失败')
         return None  # CRC8校验失败
 
-    # 提取命令ID
-    cmd_id_bytes = serial_data[sof_index + FRAME_HEADER_LEN:sof_index + FRAME_HEADER_LEN + 2]
-    expected_cmd_id = bytes([expected_cmd_id[1], expected_cmd_id[0]])
-    # 检查接收到的命令ID是否与期望的命令ID匹配
-    if cmd_id_bytes != expected_cmd_id:
-        if info:
-            print('命令ID不匹配')
-        return None  # 命令ID不匹配
-
     # 提取数据部分
-    data_start_index = sof_index + FRAME_HEADER_LEN + 2  # 数据起始位置
+    data_start_index = sof_index + FRAME_HEADER_LEN  # 数据起始位置
     data_end_index = data_start_index + data_length
     data = serial_data[data_start_index:data_end_index]
 
@@ -235,7 +164,7 @@ def receive_packet(serial_data, expected_cmd_id, info):
     frame_tail_bytes = serial_data[frame_tail_start:frame_tail_end]
 
     # 计算CRC16并与接收到的CRC16进行比较
-    calculated_crc16 = Get_CRC16_Check_Sum(header + cmd_id_bytes + data,
+    calculated_crc16 = Get_CRC16_Check_Sum(header + data,
                                            FRAME_HEADER_LEN + 2 + data_length + FRAME_TAIL_LEN)
     received_crc16 = int.from_bytes(frame_tail_bytes, byteorder='little')
     if calculated_crc16 != received_crc16:
@@ -243,26 +172,6 @@ def receive_packet(serial_data, expected_cmd_id, info):
             print('CRC16校验失败')
         return None  # CRC16校验失败
 
-    return cmd_id_bytes, data, seq
+    return data, seq
 
 
-def Radar_decision(byte_data):
-    # 确保输入是一个字节
-    if not isinstance(byte_data, int) or byte_data < 0 or byte_data > 255:
-        raise ValueError("输入必须是一个字节（0-255）")
-
-    # 提取第 0-1 位的双倍易伤机会
-    double_vulnerability_chance = byte_data & 0b00000011
-
-    # 提取第 2 位的对方双倍易伤状态
-    opponent_double_vulnerability = (byte_data & 0b00000100) >> 2
-
-    # 提取第 3-7 位（保留位，不使用）
-    reserved_bits = (byte_data & 0b11111000) >> 3
-
-    # 打印结果
-
-    # print(f"双倍易伤机会: {double_vulnerability_chance}")
-    # print(f"对方正在被触发双倍易伤: {opponent_double_vulnerability}")
-    # print(f"保留位: {reserved_bits}")
-    return double_vulnerability_chance, opponent_double_vulnerability
